@@ -1,0 +1,1069 @@
+PM.pretreat <- function (count, csum = 5, sizefactor = NULL)
+{
+	count = as.matrix(count)
+	if (is.null(colnames(count)))
+		colnames(count) = paste(1:ncol(count))
+	if (is.null(rownames(count)))
+		rownames(count) = 1:nrow(count)
+	keep = (colSums(count) >= csum)
+	count = count[, keep]
+	if (is.null(sizefactor)) {
+		count.log = log(count)
+		count.log.diff = t(count.log) - colMeans(count.log)
+		sizefactor = apply(count.log.diff, 2, function(x) {
+					exp(median(x[is.finite(x)]))})
+		sizefactor = sizefactor/sum(sizefactor) * nrow(count)
+	}
+	return (list(count = count, sizefactor = sizefactor))
+}
+
+Gof.phi <- function(phi, x, mu)     
+{
+	g = colSums((x - mu)^2/(mu * (1 + phi * mu)))
+	qs = quantile(g, c(0.25, 0.75))
+	ind.qs = (g >= qs[1]) & (g <= qs[2])
+	abs(sum(g[ind.qs]) - (nrow(x) - 1) * (ncol(x) - 1)/2)
+}
+
+Initial.phi <- function(x, mu, div = 10, p, disp.domain)
+{
+	phi = rep(0, p)           
+	ord = order(colSums(x), decreasing=T)            
+	x.ord = x[, ord]
+	mu.ord = mu[, ord]
+	nr = floor(p/div)
+	for (a in 1:div) {
+		x.div = x.ord[, ((a - 1) * nr + 1):(a * nr)]
+		mu.div = mu.ord[, ((a - 1) * nr + 1):(a * nr)]
+		phi[((a - 1) * nr + 1) : (a * nr)] = optimize(f=Gof.phi,
+				interval = disp.domain, tol = 1e-3, x = x.div, mu = mu.div)$minimum
+	}
+	phi[(a * nr) : p] = phi[a * nr]
+	phi[ord] = phi
+	return(phi)
+}
+
+Nb.loglik <- function(x, gt, phi, s, k, n)
+{
+	ff = matrix(0,k,n)
+	phi.inv = 1/phi
+	if (is.vector(x))
+		x = matrix(x, 1)
+	if (is.vector(gt))
+		gt = matrix(gt, 1)
+	for (a in 1:k) {
+		for (b in 1:n) {
+			mu = gt[a, ]*s[b]
+			ff[a,b] = sum(lgamma(phi.inv + x[b,]) - lgamma(phi.inv) 
+							- lgamma(x[b, ] + 1) - (1/phi + x[b, ]) * log(1 + phi * mu) 
+							+ x[b, ] * log(phi * mu))
+		} 
+	}
+	return(ff)
+}
+
+Nb.initialize <- function (data, k, disp.domain)
+{
+	x = data$count
+	s = data$sizefactor
+	x[x<=0] = 1e-7
+	n = nrow(x)
+	p = ncol(x)
+	x0 = x/s
+	kmeans.result = kmeans(x0, centers = k)
+	pi0 = rep(0,k)
+	gt0 = kmeans.result$centers    
+	clus = kmeans.result$cluster
+	for (a in 1:k)
+		pi0[a] = sum(clus == a)/n
+	mu0 =  matrix(0,n,p)
+	for (a in 1:n) 
+		mu0[a,] = s[a] * gt0[clus[a], ] 
+	phi0 = Initial.phi(x = x, mu = mu0, p = p, disp.domain = disp.domain)
+	gamma0 = apply(gt0, 2, mean)
+	theta0 = t(t(gt0)/gamma0)
+	fmu0 = Nb.loglik(x, gt = gt0, phi0, s, k, n)
+	return(list(gamma0 = gamma0, theta0 = theta0, phi0=phi0, pi0=pi0,
+					fmu0 = fmu0)) 
+}
+
+
+Estep <- function (k, n, fmu, pi)
+{
+	tau = matrix(0,k,n)
+	log.pi = log(pi)
+	for (a in 1 : k) {
+		if (pi[a] != 0) {
+			for (b in 1:n)
+				tau[a,b]<-pi[a]/(sum(exp(log.pi+fmu[,b]-fmu[a,b])))
+		}
+	}
+	return(tau)
+}
+
+Qp.gamma.grad <- function (gamma.t, x, s.hat, theta.hat, tau.hat, phi.hat, k, n)
+{
+	y = 0
+	if (is.matrix(x) == 0)
+		x = matrix(x, nrow = n)
+	if (is.matrix(theta.hat) == 0)
+		theta.hat = matrix(theta.hat, nrow = k)
+	for (a in 1:k) {
+		for (b in 1:n) {
+			y = y + tau.hat[a, b] * (-(1/phi.hat + x[b, ]) * phi.hat * s.hat[b]
+						* theta.hat[a, ]/(1 + phi.hat * s.hat[b] * exp(gamma.t) 
+							*theta.hat[a, ]) + x[b, ]/exp(gamma.t))
+		}
+	}
+	return(y)
+}
+
+Qp.gamma.hess.inv <- function(gamma.t, x, s.hat, theta.hat, tau.hat, phi.hat, k, n)
+{
+	y = 0
+	if (is.matrix(x) == 0)
+		x = matrix(x, nrow = n)
+	if (is.matrix(theta.hat) == 0)
+		theta.hat = matrix(theta.hat, nrow = k)
+	for (a in 1:k) {
+		for (b in 1:n) {
+			y = y + tau.hat[a, b] * ((1/phi.hat + x[b, ]) * exp(gamma.t) 
+						* (phi.hat * s.hat[b] * theta.hat[a, ])^2/(1 + phi.hat * s.hat[b]
+							* exp(gamma.t) * theta.hat[a, ])^2 - x[b, ]/exp(gamma.t))
+		}
+	}
+	return(1/y)
+}
+
+NRroot.gamma <- function(fn, grad.inv, inipar, tol=1e-4, fntol=1e-6, 
+		iterlim = 30, x, s.hat, theta.hat, tau.hat, phi.hat, k, n)
+{
+	ctr = 0
+	newpar = inipar
+	oldpar = inipar - 1
+	l.par = length(inipar)
+	f.ind = 1:l.par
+	if (l.par == 1)
+		x = matrix(x, nrow = n)
+	if (l.par == 1 | k == 1)
+		theta.hat = matrix(theta.hat, nrow = k)
+	while (ctr < iterlim & sqrt(sum((newpar - oldpar)^2)) > tol)
+	{
+		oldpar = newpar
+		f = fn(oldpar[f.ind], x[,f.ind], s.hat, theta.hat[, f.ind], tau.hat, 
+				phi.hat[f.ind], k, n)
+		f.ind1 = which(abs(f) > fntol)
+		if (length(f.ind1) == 0) 
+			break
+		f.ind = f.ind[f.ind1]
+		g = grad.inv(oldpar[f.ind], x[, f.ind], s.hat, theta.hat[, f.ind], tau.hat,
+				phi.hat[f.ind], k, n)
+		newpar[f.ind] = oldpar[f.ind] - g * f[f.ind1]
+		ctr = ctr + 1
+	}
+	list(nstep = ctr, final = newpar)
+}
+
+Qp.theta.deriv <- function(x, s, gamma, theta, tau, phi, n, lambda)
+{
+	sum(tau * (-(1/phi+x) * phi * s * gamma/(1 + phi * s * gamma * theta)
+						+ x/theta)) - lambda/theta * sign(log(theta))
+}
+
+Qp.theta.hess <- function(x, s, gamma, theta, tau, phi, n, lambda)
+{
+	sum(tau * ((1/phi + x) * (phi * s * gamma)^2/(1 + phi * s * gamma
+							* theta)^2 - x/theta^2)) + lambda/theta^2 * sign(log(theta))
+}
+
+NRroot.theta <- function(fn, grad, inipar, t1, t2, tol = 1e-6, iterlim = 50,...)
+{
+	ctr = 0
+	outrange = 0
+	newpar = inipar
+	oldpar = inipar - 1  
+	f1 = fn(t1 + 1e-5,...)        
+	f2 = fn(t2 - 1e-5,...)       
+	f3 = fn(newpar,...)
+	while (ctr < iterlim & abs(newpar - oldpar) > tol & abs(f3) > tol ) {
+		oldpar = newpar
+		newpar = oldpar - f3/grad(oldpar,...)
+		ctr = ctr + 1
+		if (newpar <= t1 | newpar >= t2) {   
+			outrange = outrange + 1
+			if (outrange == 2) {
+				t3 = (t1 + t2)/2
+				f3 = fn(t3,...)
+				newpar = t3
+				if (sign(f3) == sign(f1)) {
+					t1 = t3
+					f1 = f3
+				} 
+				else {
+					t2 = t3
+					f2 = f3
+				}
+				
+				outrange = 0
+			} 
+			else {
+				newpar<-ifelse(newpar<t1, t1+1e-5, t2-1e-5)
+				f3 = fn(newpar,...)
+			}
+		}
+		else {
+			f3 = fn(newpar,...)
+		}
+	}
+	return(list(nstep = ctr, final = newpar, t1 = t1, t2 = t2))
+}
+
+Qp.phi.grad <- function(phi, x, mu, tau, k, n)
+{
+	l = length(phi)
+	if (length(dim(mu)) < 3)
+		dim(mu) = c(k,n,l)
+	pm = mu
+	for(a in 1:n)
+		pm[,a,] = t(phi * t(mu[, a, ]))
+	y = 0
+	if(is.matrix(x) == 0)
+		x = matrix(x,nrow=n)
+	for(a in 1:k) {
+		for(b in 1:n) {
+			y = y + tau[a, b] * ((-digamma(1/phi + x[b, ]) + digamma(1/phi) 
+							+ log(1 + pm[a, b, ]))/phi^2 - mu[a, b, ]*(1/phi + x[b, ])/(1
+							+pm[a, b, ]) + x[b, ]/phi)
+		}
+	}
+	return(y)
+}
+
+Qp.phi.hess.inv <- function(phi,x,mu,tau,k,n)
+{
+	l = length(phi)
+	if(length(dim(mu)) < 3)
+		dim(mu) = c(k, n, l)
+	pm = mu
+	pm2 = pm
+	for(a in 1:n)
+	{
+		pm[, a, ]<-t(phi * t(mu[, a, ]))
+		pm2[, a, ]<-t(phi * t(pm[, a, ]))
+	}
+	y = 0
+	if(is.matrix(x) == 0)
+		x = matrix(x, nrow = n)
+	for(a in 1:k)
+	{
+		for(b in 1:n)
+		{
+			y = y + tau[a, b] * ((trigamma(1/phi + x[b, ]) - trigamma(1/phi))
+						/phi^4 + 2 * (digamma(1/phi + x[b, ]) - digamma(1/phi)
+							- log(1 + pm[a, b, ]))/phi^3 + mu[a, b, ]/(phi^2
+							* (1 + pm[a, b, ])) + mu[a, b, ] * (x[b, ] * pm2[a,b,]
+							+ 2 * pm[a, b, ] + 1)/(phi + pm2[a, b, ])^2 - x[b, ]/phi^2)
+		}
+	}
+	return(1/y)
+}
+
+NRroot.phi <- function(fn, grad.inv, inipar, tol=1e-4, fntol=1e-6, iterlim = 30,
+		disp.domain, sf1, sf2, x, mu, tau, k, n)
+{
+	ctr = 0
+	outrange = rep(0, )       
+	newpar = inipar
+	oldpar = inipar - 1
+	l.par = length(inipar)
+	outrange = rep(0, l.par)            
+	e1 = rep(disp.domain[1], l.par)
+	e2 = rep(disp.domain[2], l.par)
+	f.ind <- 1:l.par
+	if(l.par == 1)
+	{
+		x = as.matrix(x, nrow = n)
+	} 
+	if(length(dim(mu)) < 3)
+	{
+		mu = array(mu,dim = c(k, n, l.par))
+	}
+	while(ctr < iterlim & sqrt(sum((newpar - oldpar)^2)) > tol)
+	{
+		oldpar = newpar
+		f = fn(oldpar[f.ind], x[,f.ind], mu[, , f.ind], tau, k, n)
+		f.ind1 = which(abs(f) > fntol)
+		if (length(f.ind1) == 0)
+			break
+		f.ind = f.ind[f.ind1]
+		g = grad.inv(oldpar[f.ind], x[, f.ind], mu[, , f.ind], tau, k, n)
+		newpar[f.ind] = oldpar[f.ind] - g * f[f.ind1]
+		lout = f.ind[newpar[f.ind] < e1[f.ind]]
+		rout = f.ind[newpar[f.ind] > e2[f.ind]]
+		if((length(lout) + length(rout)) > 0)
+		{
+			out.ind = c(lout, rout)
+			outrange[out.ind] = outrange[out.ind] + 1
+			out2.ind = out.ind[outrange[out.ind] == 2]
+			if(length(out2.ind) != 0)
+			{
+				e3 = (e1[out2.ind] + e2[out2.ind])/2
+				sf3 = sign(fn(e3, x[, out2.ind], mu[, , out2.ind], tau, k, n))
+				sf31.ind = which(sf3 == sf1[out2.ind])
+				e1[out2.ind][sf31.ind] = e3[sf31.ind]
+				newpar[out2.ind][sf31.ind] = e3[sf31.ind]
+				sf32.ind = which(sf3 == sf2[out2.ind])
+				e2[out2.ind][sf32.ind] = e3[sf32.ind]
+				newpar[out2.ind][sf32.ind] = e3[sf32.ind]
+				lout = lout[!lout %in% out2.ind]
+				rout = rout[!rout %in% out2.ind]
+				outrange[out2.ind] = 0
+			}
+			newpar[lout] = e1[lout]
+			newpar[rout] = e2[rout]
+		}
+		ctr = ctr + 1
+	}
+	list(nstep = ctr, final = newpar)
+}
+
+
+Nb.Mstep <- function(x, s, k, n, p, tau, theta, gamma, phi, lambda.c, disp.domain)
+{
+	pi = rowSums(tau)/n 
+	g0 = Qp.gamma.grad(gamma.t = log(gamma), x, s, theta, tau, phi, k, n)
+	g.ind = which(g0 > 1e-6)    
+	if (length(g.ind) != 0) {
+		gamma.out = NRroot.gamma(fn=Qp.gamma.grad,grad.inv=Qp.gamma.hess.inv,
+				inipar = log(gamma[g.ind]), x = x[, g.ind],s.hat = s, theta.hat = 
+						theta[, g.ind], tau.hat = tau, phi.hat=phi[g.ind], k =k, n = n)
+		gamma[g.ind] = exp(gamma.out$final)
+	}
+	if (k != 1){
+		for (a in 1:k){
+			if(pi[a] < 1e-4) {       
+				theta[a, ] = 1       
+				next
+			} 
+			for (b in 1:p) {
+				f0 = Qp.theta.deriv(x[, b], s, gamma[b], theta[a, b],tau[a, ],
+						phi[b], n, lambda.c)
+				if (abs(f0) < 1e-6) 
+					next
+				f1 = Qp.theta.deriv(x[, b], s, gamma[b], theta=1e-5, tau[a,], 
+						phi[b], n, lambda.c)
+				if (f1 <= 0) {
+					theta[a,b] = 1e-5
+					next
+				}           
+				f2 = Qp.theta.deriv(x[, b], s, gamma[b],theta = 1 - 1e-6, tau[a,],
+						phi[b], n, lambda.c)
+				f3 = Qp.theta.deriv(x[,b], s, gamma[b], theta = 1 + 1e-6, tau[a,],
+						phi[b], n, lambda.c)
+				if (sign(f2) != sign(f3)) {
+					theta[a,b] = 1
+					next
+				}
+				if (sign(f1) != sign(f2)) {
+					if (theta[a,b] <= 1) {
+						theta[a,b] = NRroot.theta(fn = Qp.theta.deriv, grad = Qp.theta.hess,
+								inipar = theta[a, b], t1 = 0,t2 = 1, x = x[, b], s = s, 
+								gamma = gamma[b], tau = tau[a, ], phi = phi[b], n = n,
+								lambda = lambda.c)$final
+						next
+					}
+					theta[a,b] = NRroot.theta(fn = Qp.theta.deriv, grad=Qp.theta.hess,
+							inipar = 1 - 1e-3, t1 = 0, t2 = 1, x = x[, b], s = s, 
+							gamma = gamma[b], tau = tau[a, ], phi = phi[b] ,n = n,
+							lambda = lambda.c)$final
+					next
+				}           
+				f4 = Qp.theta.deriv(x = x[, b], s = s, gamma = gamma[b], theta = 
+								1.5 * max(x[, b]/(gamma[b] * s)), tau = tau[a, ], phi = phi[b],
+						n = n, lambda = lambda.c)
+				if (theta[a, b] >= 1) {
+					theta[a,b] = NRroot.theta(fn = Qp.theta.deriv, grad = Qp.theta.hess,
+							inipar = theta[a, b], t1 = 1, t2 = 1.5 * max(x[, b]/(gamma[b] * s)),
+							x = x[,b], s = s, gamma = gamma[b], tau = tau[a, ], phi = phi[b],
+							n = n, lambda = lambda.c)$final  
+					next
+				}
+				theta[a, b] = NRroot.theta(fn = Qp.theta.deriv, grad = Qp.theta.hess,
+						inipar = 1 + 1e-3, t1 = 1,t2 = 1.5 * max(x[, b]/(gamma[b] * s)),
+						x = x[, b], s = s, gamma = gamma[b], tau=tau[a, ], phi=phi[b],
+						n = n, lambda = lambda.c)$final                       
+			}
+		}
+	}
+	mu = array(0, dim = c(k, n, p))
+	gt = t(gamma * t(theta))
+	for (a in 1:n)
+		mu[, a, ] = s[a] * gt
+	fp0 = Qp.phi.grad(phi, x, mu, tau, k, n)         
+	fp.ind = which(fp0 > 1e-6)                 
+	lfp = length(fp.ind)
+	if(lfp != 0)                   
+	{
+		phi.edge1 = rep(disp.domain[1], lfp)
+		phi.edge2 = rep(disp.domain[2], lfp)
+		fp1 = Qp.phi.grad(phi.edge1, x[, fp.ind], mu[, , fp.ind], tau, k, n)
+		fp2 = Qp.phi.grad(phi.edge2, x[, fp.ind], mu[, , fp.ind], tau, k, n)
+		sf1 = sign(fp1)
+		sf2 = sign(fp2)
+		sf.ind = which(sf1 == sf2)
+		lsf = length(sf.ind)
+		if(lsf != 0)
+		{
+			phi[fp.ind][sf1[sf.ind] > 0] = disp.domain[2]
+			phi[fp.ind][sf1[sf.ind] < 0] = disp.domain[1]
+			si.ind = -sf.ind
+		} 
+		else {
+			si.ind = 1:lfp
+		}
+		if(lsf != lfp)
+		{
+			fp.ind = fp.ind[si.ind]
+			phi.out = NRroot.phi(fn = Qp.phi.grad, grad.inv = Qp.phi.hess.inv,
+					inipar = phi[fp.ind], iterlim = 50, disp.domain = disp.domain,
+					sf1 = sf1[si.ind], sf2 = sf2[si.ind], x=x[, fp.ind], 
+					mu = mu[, , fp.ind], tau = tau, k = k, n = n)
+			phi[fp.ind] = phi.out$final
+		}
+	}
+	M.out = list(
+			pi=pi,
+			gamma=gamma,
+			theta=theta,
+			phi=phi,
+			gt=gt
+	)
+	return(M.out)
+}
+
+
+
+Nb.EM <- function (data, k, lambda, MAX_iter, threshold, disp.domain, is.BIC, initial)
+{
+	x = data$count
+	s = data$sizefactor
+	gnames = colnames(x)
+	n = nrow(x)
+	p = ncol(x)
+	gamma0 = initial$gamma0
+	theta0 = initial$theta0
+	phi0 = initial$phi0
+	fmu0 = initial$fmu0
+	pi0 = initial$pi0
+	x[x <= 0] = 1e-7
+	if (k == 1) 
+		lambda = 0
+	len = length(lambda)
+	ploglik1 = rep(10, len)     
+	ploglik2 = rep(1, len)
+	diff = ploglik2
+	BIC = ploglik2
+	k.hat = rep(k, len)       
+	iter = BIC              
+	group_member = matrix(0, len, n)
+	q.out = BIC
+	gnames.st = matrix(0,len,p)
+	phi.out = gnames.st
+	theta.diff.cmean = gnames.st
+	gt.hat = array(0, dim = c(k, p, len))   
+	for (l in 1:len) {
+		pi = pi0
+		phi = phi0
+		theta = theta0
+		gamma = gamma0
+		fmu = fmu0
+		lambda.c = lambda[l]
+		i = 0
+		while ((i < MAX_iter) & (abs((ploglik1[l] - ploglik2[l])/ploglik1[l]) > threshold)) {
+			ploglik1[l] = ploglik2[l]
+			i = i+1
+			tau = Estep(k, n, fmu, pi)
+			M.out = Nb.Mstep(x, s, k, n, p, tau, theta, gamma, phi, lambda.c, disp.domain)
+			pi = M.out$pi
+			gamma = M.out$gamma
+			theta = M.out$theta
+			phi = M.out$phi
+			gt = M.out$gt
+			group_member[l, ] = apply(tau, 2, which.max)
+			label = unique(group_member[l, ])
+			k.hat[l] = length(label)
+			fmu = Nb.loglik(x, gt, phi, s, k, n)
+			if (k.hat[l] < k) {
+				fmu.l = fmu[label, ]
+				tau.l = tau[label, ]
+				theta.l = theta[label,]
+				if (k.hat[l] == 1) {
+					tau.l = matrix(tau.l, nrow = 1)
+					theta.l = matrix(theta.l, nrow = 1)
+					fmu.l = matrix(fmu, nrow = 1)
+				}
+				fmu.max = apply(fmu.l, 2, max)
+				pi.l = rowSums(tau.l)/n 
+				temp = colSums(pi.l * exp(t(t(fmu.l) - fmu.max)))
+				loglik = sum(fmu.max + log(temp))
+				ploglik2[l] = loglik - lambda.c * sum(pi.l * abs(log(theta.l)))
+				next
+			}
+			fmu.max = apply(fmu, 2, max)
+			temp = colSums(pi * exp(t(t(fmu) - fmu.max)))
+			loglik = sum(fmu.max + log(temp))              
+			ploglik2[l] = loglik - lambda.c * sum(pi * abs(log(theta)))	
+		}
+		phi.out[l, ] = phi  
+		if (k.hat[l] < k) {
+			theta.diff = abs(theta[label, ] - 1)
+			if(k.hat[l] == 1)
+				theta.diff = matrix(theta.diff, nrow = 1)
+		} else {
+			theta.diff = abs(theta - 1)
+		}
+		q = sum(theta.diff < 1e-3)
+		gt.hat[, , l] = gt 
+		if(is.BIC == "BIC")
+		{
+			BIC[l] = -2 * loglik + log(n) * (k.hat[l] + 2 * p + k.hat[l] * p - 1 - q)
+		} else {
+			BIC[l] = -2 * loglik + (log(n) + log(p)) * (k.hat[l] + 2 * p + k.hat[l] * p - 1 - q)
+		}
+		diff[l] = abs((ploglik1[l] - ploglik2[l])/ploglik1[l])
+		iter[l] = i
+		q.out[l] = q
+		theta.diff.cmean[l, ] = sort(colMeans(theta.diff), decreasing = T)
+		gnames.st[l, ] = order(colMeans(theta.diff), decreasing = T)	
+	}
+	opt = which.min(BIC)
+	gt.out = gt.hat[, , opt]
+	if (k == 1) 
+		gt.out = matrix(gt.out, k)
+	rownames(gt.out) = paste(1:k)
+	if (k.hat[opt] < k) {
+		k1 = unique(group_member[opt, ])
+		k1.st = sort(k1)
+		gt.out = gt.out[k1.st, ]
+		rownames(gt.out) = paste(1:k.hat[opt])
+		for (a in 1:k.hat[opt]) 
+			group_member[opt, ][group_member[opt, ] == k1.st[a]] = a
+	}
+	out = list(
+			phi = phi.out[opt, ],
+			gt = gt.out,
+			group_member = group_member[opt, ],
+			BIC = BIC[opt],
+			lambda = lambda[opt],
+			theta.cdiff = theta.diff.cmean[opt, ],
+			gnames.st = gnames[gnames.st[opt, ]],
+			sizefactor = s,
+			iter = iter[opt],
+			diff = diff[opt]
+	)
+	return(out)
+}
+#################
+#Poisson
+Pois.loglik = function(x, gt, s, k, n)
+{
+	ff = matrix(0, k, n)
+	if (is.vector(x))
+		x = matrix(x, 1)
+	if (is.vector(gt))
+		gt = matrix(gt, 1)
+	for (a in 1:k) {
+		for (b in 1:n) {
+			mu = gt[a, ] * s[b]
+			ff[a, b] = sum(-mu + x[b, ] * log(mu) - lfactorial(x[b, ]))
+		}
+	}
+	return(ff)
+}
+
+Pois.initialize <- function (data, k)
+{
+	x = data$count
+	s = data$sizefactor
+	x[x<=0] = 1e-7
+	n = nrow(x)
+	p = ncol(x)
+	x0 = x/s
+	kmeans.result = kmeans(x0, centers = k)
+	pi0 = rep(0,k)
+	for (a in 1:k) 
+		gt0 = kmeans.result$centers     
+	clus = kmeans.result$cluster
+	for (a in 1:k)
+		pi0[a] = sum(clus == a)/n
+	gt0[gt0 <= 0] = 0.1/n
+	gamma0 = apply(gt0, 2, mean)
+	theta0 = t(t(gt0)/gamma0)
+	fmu0 = Pois.loglik(x, gt = gt0, s, k, n)	
+	return(list(gamma0 = gamma0, theta0 = theta0, pi0 = pi0, fmu0 = fmu0)) 
+}
+
+CalculateSize<-function(a,b,c,n,x)
+{
+	sum((a * x)/(b * x + c)) + x - n
+}
+
+Pois.Mstep <- function(x, s, k, n, p, tau, theta, gamma, lambda.c, s.update)
+{
+	pi.hat = rowSums(tau)/n 
+	if (s.update) {
+		s.a = rowSums(x)
+		s.b1 = t(tau) %*% theta %*% gamma
+		h = which.min(s.b1)
+		s.b = s.b1[-h] - s.b1[h]
+		s[h] = uniroot(CalculateSize, c(0, n), tol = 1e-4, a = s.a[-h],
+				b = s.b, c = s.a[h], n = n)$root
+		s[-h] = (s.a[-h] * s[h])/(s.b * s[h] + s.a[h])
+	}
+	pt0 = rowSums(t(t(tau) * s))
+	g.num = colSums(x)
+	g.den = colSums(pt0 * theta)
+	gamma.hat = g.num/g.den
+	for (a in 1:k) {
+		if (pi.hat[a] < 1e-4) {
+			theta[a, ] = 1
+			next
+		}
+		pt = pt0[a] * gamma.hat  
+		pt1 = tau[a, ] %*% x/(pt) - 1
+		pt2 = abs(pt1) - lambda.c * pi.hat[a]/pt
+		theta[a, ] = sign(pt1) * ifelse(pt2 > 0, pt2, 0) + 1	
+	}
+	return(list(pi = pi.hat, s = s, gamma = gamma.hat, theta = theta))
+}
+
+Pois.EM <- function (data, k, lambda, s.update, MAX_iter, threshold, is.BIC, initial)
+{
+	x = data$count
+	s0 = data$sizefactor
+	gnames = colnames(x)
+	n = nrow(x)
+	p = ncol(x)
+	gamma0 = initial$gamma0
+	theta0 = initial$theta0
+	fmu0 = initial$fmu0
+	pi0 = initial$pi0
+	x[x <= 0] = 1e-7
+	if (k == 1) 
+		lambda = 0
+	len = length(lambda)
+	ploglik1 = rep(10, len)    
+	ploglik2 = rep(1, len)
+	BIC = ploglik2
+	k.hat = rep(k, len)         
+	iter = BIC                
+	group_member = matrix(0, len, n)
+	colnames(group_member) = rownames(x)
+	gnames.st = matrix(0,len,p)
+	theta.diff.cmean = gnames.st
+	gt.hat = array(0, dim = c(k, p, len))
+	if (s.update)
+		s.hat = matrix(0, len, n)
+	for (l in 1:len) {
+		pi = pi0
+		theta = theta0
+		gamma = gamma0
+		s = s0
+		fmu = fmu0
+		lambda.c = lambda[l]
+		i = 0
+		while ((i < MAX_iter) & (abs((ploglik1[l] - ploglik2[l])/ploglik1[l]) > threshold)) {
+			ploglik1[l] = ploglik2[l]
+			i = i+1
+			tau = Estep(k, n, fmu, pi)
+			M.out = Pois.Mstep(x, s, k, n, p, tau, theta, gamma, lambda.c, s.update)
+			pi = M.out$pi
+			gamma = M.out$gamma
+			theta = M.out$theta
+			if (s.update) {
+				s = M.out$s
+				s.hat[l, ] = s 
+			}			
+			gt = t(gamma * t(theta))
+			fmu = Pois.loglik(x, gt, s, k, n)
+			group_member[l, ] = apply(tau, 2, which.max)
+			label = unique(group_member[l, ])
+			k.hat[l] = length(label)
+			if (k.hat[l] < k) {
+				fmu.l = fmu[label, ]
+				tau.l = tau[label, ]
+				theta.l = theta[label,]
+				if (k.hat[l] == 1) {
+					tau.l = matrix(tau.l, nrow = 1)
+					theta.l = matrix(theta.l, nrow = 1)
+					fmu.l = matrix(fmu, nrow = 1)
+				}
+				fmu.max = apply(fmu.l, 2, max)
+				pi.l = rowSums(tau.l)/n 
+				temp = colSums(pi.l * exp(t(t(fmu.l) - fmu.max)))
+				loglik = sum(fmu.max + log(temp))
+				ploglik2[l] = loglik - lambda.c * sum(pi.l * abs(log(theta.l)))
+				next
+			}
+			fmu.max = apply(fmu, 2, max)
+			temp = colSums(pi * exp(t(t(fmu) - fmu.max)))
+			loglik = sum(fmu.max + log(temp))              
+			ploglik2[l] = loglik - lambda.c * sum(pi * abs(log(theta)))	
+		}
+		if (k.hat[l] < k) {
+			theta.diff = abs(theta[label, ] - 1)
+			if(k.hat[l] == 1)
+				theta.diff = matrix(theta.diff, nrow = 1)
+		} else {
+			theta.diff = abs(theta - 1)
+		}
+		q = sum(theta.diff < 1e-3)
+		gt.hat[, , l] = gt 
+		if(is.BIC == "BIC")
+		{
+			BIC[l] = -2 * loglik + log(n) * (k.hat[l] + p + k.hat[l] * p - 1 - q)
+		} else {
+			BIC[l] = -2 * loglik + (log(n) + log(p)) * (k.hat[l] + p + k.hat[l] * p - 1 - q)
+		}
+		iter[l] = i
+		theta.diff.cmean[l, ] = sort(colMeans(theta.diff), decreasing = T)
+		gnames.st[l, ] = order(colMeans(theta.diff), decreasing = T)
+	}
+	opt = which.min(BIC)
+	gt.out = gt.hat[, , opt]
+	if (k == 1) 
+		gt.out = matrix(gt.out, k)
+	rownames(gt.out) = paste(1:k)
+	if (k.hat[opt] < k) {
+		k1 = unique(group_member[opt, ])
+		k1.st = sort(k1)
+		gt.out = gt.out[k1.st, ]
+		rownames(gt.out) = paste(1:k.hat[opt])
+		for (a in 1:k.hat[opt]) 
+			group_member[opt, ][group_member[opt, ] == k1.st[a]] = a
+	}
+	if (s.update)
+		s = s.hat[opt, ]
+	out = list(
+			gt = gt.out,
+			group_member = group_member[opt, ],
+			BIC = BIC[opt],
+			lambda = lambda[opt],
+			theta.cdiff = theta.diff.cmean[opt, ],
+			gnames.st = gnames[gnames.st[opt, ]],
+			sizefactor = s,
+			iter = iter[opt]
+	)
+	return(out)
+}
+#################
+PMixClus <- function (data, k.init, lambda, model = "NB", s.update = F, MAX_iter = 100, 
+		threshold = 1e-7, disp.domain = c(1e-6, 4), is.BIC = "BIC")
+{
+	l = length(k.init)
+	p = ncol(data$count)
+	n = nrow(data$count)
+	BIC = 1:l
+	lambda.sel = BIC
+	theta.cdiff = matrix(0, l, p)
+	gnames.st = theta.cdiff
+	group = matrix(0, l, n)
+	sizefactor = group
+	gt.hat = vector("list", l)
+	colnames(group) = rownames(data$count)
+	i = 0
+	if (model == "NB") {
+		phi.hat = theta.cdiff
+		for (k in k.init) {
+			initial = Nb.initialize(data, k, disp.domain)
+			results = Nb.EM(data, k, lambda, MAX_iter, threshold, disp.domain, is.BIC, initial)
+			i = i+1
+			BIC[i] = results$BIC
+			lambda.sel[i] = results$lambda
+			theta.cdiff[i, ] = results$theta.cdiff
+			gnames.st[i, ] = results$gnames.st
+			group[i, ] = results$group_member
+			sizefactor[i, ] = results$sizefactor
+			gt.hat[[i]] = results$gt
+			phi.hat[i, ] = results$phi
+			cat("When k =", k, ", iteration stops after", results$iter, "steps.", "\n")
+		}
+		out = list(
+				BIC = BIC,
+				lambda.sel = lambda.sel,
+				theta.cdiff = theta.cdiff,
+				gnames.st = gnames.st,
+				group = group,
+				sizefactor = sizefactor,
+				gt.hat = gt.hat,
+				phi.hat = phi.hat
+				)
+	}
+	if (model == "Pois") {
+		library(mclust)
+		for (k in k.init) {
+			initial = Pois.initialize(data, k)
+			results = Pois.EM(data, k, lambda, s.update, MAX_iter, threshold, is.BIC, initial)
+			i = i+1
+			BIC[i] = results$BIC
+			lambda.sel[i] = results$lambda
+			theta.cdiff[i, ] = results$theta.cdiff
+			gnames.st[i, ] = results$gnames.st
+			group[i, ] = results$group_member
+			sizefactor[i, ] = results$sizefactor
+			gt.hat[[i]] = results$gt
+			cat("When k =", k, ", iteration stops after", results$iter, "steps.", "\n")
+		}
+		out = list(
+				BIC = BIC,
+				lambda.sel = lambda.sel,
+				theta.cdiff = theta.cdiff,
+				gnames.st = gnames.st,
+				group = group,
+				sizefactor = sizefactor,
+				gt.hat = gt.hat
+		)
+	}
+	return(out)
+}
+
+#########
+#Plot HH tree
+Dist <- function (x, p, s, gt, phi, model, group, disp.domain)
+{
+	k0 = unique(group)
+	k = length(k0)
+	pairs = cbind(rep(k0, each = k), rep(k0, k))
+	pairs = pairs[pairs[, 1] < pairs[, 2], ]
+	if (is.vector(pairs))
+		pairs = matrix(pairs, 1)
+	np = nrow(pairs)
+	d0 = rep(0, np)
+	gt3 = matrix(0, np, ncol(gt))
+	theta = matrix(1, 1, p)
+	for (i in 1:np) {
+		x1 = x[group == pairs[i, 1], ]
+		if (is.vector(x1))
+			x1 = matrix(x1, 1)
+		x2 = x[group == pairs[i, 2], ]
+		if (is.vector(x2))
+			x2 = matrix(x2, 1)
+		x3 = rbind(x1, x2)
+		s1 = s[group == pairs[i, 1]]
+		s2 = s[group == pairs[i, 2]]
+		s3 = c(s1, s2)
+		gt1 = gt[paste(pairs[i, 1]), ]
+		gt2 = gt[paste(pairs[i, 2]), ]
+		w1 = nrow(x1)/(nrow(x1) + nrow(x2))	
+		gamma= w1 * gt1 + (1 - w1) * gt2 
+		tau = matrix(1, 1, length(s3))
+		if (model == "NB") {
+			M.out3 = Nb.Mstep(x3, s3, k = 1, n = length(s3), p, tau, theta, 
+					gamma, phi, lambda.c = 0, disp.domain)
+			gt3[i, ] = M.out3$gt
+			d0[i] = sum(Nb.loglik(x1, gt1, phi, s1, k=1, n=nrow(x1))) + sum(Nb.loglik(x2, gt2, phi, s2, 
+							k=1, n=nrow(x2))) - sum(Nb.loglik(x3, gt3[i, ], phi, s3, k=1, n=nrow(x3)))			
+		} else {
+			M.out3 = Pois.Mstep(x3, s3, k = 1, n = length(s3), p, tau,
+					theta, gamma, lambda.c = 0, s.update=F)
+			gt3[i, ] = M.out3$gamma
+			d0[i] = sum(Pois.loglik(x1, gt1, s1, k=1, n=nrow(x1))) + sum(Nb.loglik(x2, gt2, s2, 
+							k=1, n=nrow(x2))) - sum(Nb.loglik(x3, gt3[i, ], s3, k=1, n=nrow(x3)))
+		}
+	}
+	m = which.min(d0)
+	d = c(pairs[m, ], d0[m])
+	return(list(d = d, gt.merge = gt3[m, ]))
+}
+
+HH.Tree <- function (data, gt , phi = NULL, group, model = "NB", disp.domain = c(1e-6, 4))
+{
+	x = data$count
+	s = data$sizefactor
+	x[x <= 0] = 1e-7
+	n = nrow(x)
+	p = ncol(x)
+	k0 = unique(group)
+	k = length(k0)
+	tree = matrix(0, k, 3)
+	colnames(tree) = c("k1", "k2", "distance")
+	theta = matrix(1, 1, p)
+	for ( a in 1:k) {
+		ind = which(group == k0[a])
+		tau = matrix(1, 1, length(ind))
+		gamma = gt[paste(k0[a]), ]
+		x0 = x[ind, ]
+		if (length(ind) == 1) {
+			x0 = matrix(x0, 1)
+			gt[paste(k0[a]), ] = x0/s[ind]
+			next
+		}
+		if (model == "NB") {
+			M.out = Nb.Mstep(x = x0, s[ind], k = 1, n = length(ind), p, tau,
+					theta, gamma, phi, lambda.c = 0, disp.domain)
+			gt[paste(k0[a]), ] = M.out$gt
+		} else {
+			M.out = Pois.Mstep(x = x0, s[ind], k = 1, n = length(ind), p, tau,
+					theta, gamma, lambda.c = 0, s.update=F)
+			gt[paste(k0[a]), ] = M.out$gamma
+		}
+		
+	}
+	for (i in 1:(k-1)) {
+		print(paste("level", i))
+		d.out = Dist(x, p, s, gt, phi, model, group, disp.domain)
+		d = d.out$d
+		tree[i, ] = d
+		k1 = d[1]
+		k2 = d[2]
+		group[group == k2] = k1
+		gt[paste(k1), ] = d.out$gt.merge
+		gt = gt[rownames(gt) != paste(k2), ]
+	}
+	tree[k, ] = 1
+	return(tree)
+}
+
+in.tree <- function (tree, x) 
+{
+	L = length(tree)
+	id = 0
+	for (i in 1:L) if (x %in% tree[[i]]) 
+			id = i
+	return(id)
+}
+
+
+Sort.node <- function (k1, k2)
+{
+	nK = length(k1)
+	tree = as.list(1:nK)
+	for (i in 1:(nK - 1)) {
+		id1 = in.tree(tree, k1[i])
+		id2 = in.tree(tree, k2[i])
+		tree[[id1]] = c(tree[[id1]], tree[[id2]])
+		tree = tree[-id2]
+	}
+	return(tree[[1]])
+}
+
+Loc.node <- function (k1, k2, h, tg, nodes)
+{
+	k = length(h)
+	k1X = k2X = 1:k
+	x = cumsum(tg[nodes])
+	x = x/max(x) * k
+	xm = head(c(0, x), k)/2 + x/2
+	for (i in 1:k) {
+		k1X[i] = xm[nodes == k1[i]]
+		k2X[i] = xm[nodes == k2[i]]
+	}
+	k1H = k2H = rep(0, k)
+	H = matrix(0, k, k)
+	for (i in 2:k) {
+		id = 1:(i - 1)
+		id = tail(id[k1[1:(i - 1)] == k1[i]], 1)
+		if (length(id) > 0) {
+			k1H[i] = k1H[id] + k2H[id] + h[id]
+			k1X[i] = k1X[id]/2 + k2X[id]/2
+		}
+		id = 1:(i - 1)
+		id = tail(id[k1[1:(i - 1)] == k2[i]], 1)
+		if (length(id) > 0) {
+			k2H[i] = k1H[id] + k2H[id] + h[id]
+			k2X[i] = k1X[id]/2 + k2X[id]/2
+		}
+	}
+	return(list(k1h = k1H, k2h = k2H, k1x = k1X, k2x = k2X))
+}
+
+plotbr <- function (cl, cr, ch) 
+{
+	sx0 = c(cl[1], cr[1], cl[1])
+	sy0 = c(cl[2], cr[2], ch)
+	sx1 = c(cl[1], cr[1], cr[1])
+	sy1 = c(ch, ch, ch)
+	segments(sx0, sy0, sx1, sy1)
+}
+
+
+plotHH.tree <- function (sample.names, tree, group, group.true = NULL, tree.title = "Hybrid-Hierarchical Tree")
+{
+	k1 = tree[, 1]
+	k2 = tree[, 2]
+	k = length(k1)
+	h = rep(0.001, k)
+	tg = table(group)
+	nodes = Sort.node(k1, k2)
+	tree.node = Loc.node(k1, k2, h, tg, nodes)
+	k1h = tree.node$k1h
+	k2h = tree.node$k2h
+	k1x = tree.node$k1x
+	k2x = tree.node$k2x
+	maxH = max(c(k1h + k2h)[1:(k - 1)])+h[1]
+	par(mar = c(1, 1, 1, 1))
+	plot(0, 0, xlim = c(0, k), ylim = c(-0.8 * maxH, 1.1 * maxH), cex = 0, 
+			xaxt = "n", yaxt = "n", xlab = "", ylab = "", main = "", cex.main = 1)
+	text(k/2, 1.1 * maxH, tree.title, cex = 1.2, font = 2)
+	for (i in 1:(k - 1)) {
+		clx = k1x[i]
+		crx = k2x[i]
+		cly = k1h[i]
+		cry = k2h[i]
+		ch = h[i] + k1h[i] + k2h[i]
+		plotbr(c(clx, cly), c(crx, cry), ch)
+	}
+	xn0 = cumsum(tg[nodes])
+	xn0 = xn0/max(xn0) * k
+	xm = head(c(0, xn0), k)/2 + xn0/2
+	xn0 = c(0, xn0)	
+	v = 0.01 * k
+	for (a in 1:k) {
+		gl = which(group == a)
+		m = which(nodes == a)
+		lgl = length(gl)
+		if (lgl == 1) {
+			text(xm[m], -maxH/10, sample.names[gl], srt = 90, cex = 0.8,
+					offset = 2, adj = c(1.2, 0.5))
+			if (!is.null(group.true)) {
+				segments(xm[m], 0, xm[m], -maxH/10, col = group.true[gl]+1)
+				next
+			}
+			segments(xm[m], 0, xm[m], -maxH/10)
+			next
+		}
+		nod = seq(xn0[m] + v, xn0[m + 1]-v, length=lgl)
+		for (b in 1:lgl) {
+			text(nod[b], -maxH/10, sample.names[gl[b]], srt = 90, cex = 0.8,
+					offset = 2, adj = c(1.2, 0.5))
+		}
+		segments(xn0[m] + v, 0, xn0[m + 1]-v, 0)
+		if (!is.null(group.true)) {
+			segments(nod, 0, nod, -maxH/10, col = group.true[gl] + 1)
+			next
+		}
+		segments(nod, 0, nod, -maxH/10)
+	}
+}
+
+Cutree = function (tree, group, level)
+{
+	lg = length(unique(group))
+	if (lg < level)
+		stop ("The level is higher than the tree!")
+	if (level == 1) {
+		group.hat = matrix(rep(1, length(group)), 1) 
+		colnames(group.hat) = colnames(group)
+	} else {
+		m = lg - level
+		group.hat = group
+		if (m == 0) {
+			group.hat = group
+		} else {
+			for (i in 1:m) {
+				group.hat[group.hat == tree[i, 2]] = tree[i, 1]
+			}
+		}
+	}
+	return(group.hat)
+}
