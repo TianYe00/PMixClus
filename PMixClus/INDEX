@@ -1,0 +1,8 @@
+Cutree                  Cut the Hybrid-Hierarchical tree.
+HH.Tree                 Construct the Hybrid-Hierarchical tree.
+PM.pretreat             Filter the data and compute the size factor for
+                        each sample by median ratio.
+PMixClus                Penalized Poisson or NB model based clustering
+                        for count data.
+plotHH.tree             Plot the Hybrid-Hierarchical tree.
+seq_count               Simulated RNA-Seq count data
