@@ -10,4 +10,4 @@ Description: Penalized NB or Poisson mixuture model with application to cluster
 Suggests: MBCluster.Seq
 License: GPL- (>=3)
 LazyData: true
-Built: R 3.1.0; ; 2014-10-23 12:52:37 UTC; windows
+Built: R 3.1.0; ; 2014-10-31 09:40:22 UTC; windows
